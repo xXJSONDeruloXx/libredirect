@@ -34,7 +34,7 @@ COMMON_DEFS  = \
 	-DOLD_SUB_LONG='"$(OLD_SUB_LONG)"' \
 	-DNEW_SUB_LONG='"$(NEW_SUB_LONG)"'
 
-GLIBC_CFLAGS  = -shared -fPIC -O2 -Wall -Wno-unused-function \
+GLIBC_CFLAGS  = -shared -fPIC -O2 -Wall -Wno-unused-function -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	$(COMMON_DEFS) \
 	-DGOLDBERG_PRELOAD='"$(GOLDBERG_PRELOAD)"' \
 	-DTMP_REDIRECT='"$(DATA_PREFIX)/usr/tmp"' \

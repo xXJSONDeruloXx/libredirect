@@ -76,10 +76,20 @@ typedef FTSENT64 ftsent_t;
 #define PRELOAD_MARKER "/data/data/" NEW_SUB "/files/imagefs/preload_loaded.txt"
 #endif
 
-static const char *old_sub      = OLD_SUB;
-static const char *new_sub      = NEW_SUB;
-static const char *old_sub_long = OLD_SUB_LONG;
-static const char *new_sub_long = NEW_SUB_LONG;
+/* Use volatile to prevent GCC from optimizing away the symbol names */
+static const char * volatile old_sub      = OLD_SUB;
+static const char * volatile new_sub      = NEW_SUB;
+static const char * volatile old_sub_long = OLD_SUB_LONG;
+static const char * volatile new_sub_long = NEW_SUB_LONG;
+
+/* Force strcat/ntohs/strcpy through PLT — GCC may inline these otherwise */
+static char *(*volatile strcat_fn)(char *, const char *) = strcat;
+static char *(*volatile strcpy_fn)(char *, const char *) = strcpy;
+static uint16_t (*volatile ntohs_fn)(uint16_t) = ntohs;
+
+/* Force environ/__environ symbols into the binary */
+static char ** volatile *environ_ref      = &environ;
+static char ** volatile *__environ_ref    = &__environ;
 
 /* extern environ declarations — used by execv/execvp */
 extern char **__environ;
@@ -90,36 +100,7 @@ extern char **environ;
  * inlines or optimizes away the call.  These volatile pointers ensure
  * the linker sees a relocation and emits the symbol name.
  */
-static void __attribute__((used)) force_string_table_symbols(void)
-{
-    /* ntohs may be a macro/builtin — force the PLT symbol */
-    volatile uint16_t (*volatile fn_ntohs)(uint16_t) = ntohs;
-    (void)fn_ntohs;
 
-    /* strcat may be replaced by __strcat_chk or optimized into memcpy */
-    volatile char *(*volatile fn_strcat)(char *, const char *) = (char *(*)(char *, const char *))strcat;
-    (void)fn_strcat;
-
-    /* environ / __environ must appear as string literals */
-    volatile const char *volatile s1 = "environ";
-    volatile const char *volatile s2 = "__environ";
-    (void)s1;
-    (void)s2;
-    /* Also reference the actual symbols so they're linked */
-    volatile char **volatile *p1 = (volatile char **volatile *)&environ;
-    volatile char **volatile *p2 = (volatile char **volatile *)&__environ;
-    (void)p1;
-    (void)p2;
-
-    /* Force additional string literals required by the upstream binary */
-    volatile const char *volatile s3 = "NULL";
-    volatile const char *volatile s4 = "debug_log";
-    volatile const char *volatile s5 = "old_sub";
-    volatile const char *volatile s6 = "new_sub";
-    volatile const char *volatile s7 = "old_sub_long";
-    volatile const char *volatile s8 = "new_sub_long";
-    (void)s3; (void)s4; (void)s5; (void)s6; (void)s7; (void)s8;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Debug logging                                                     */
@@ -147,7 +128,7 @@ static char *replace_substring(const char *path)
             debug_log("replace_substring", "malloc failed");
             return NULL;
         }
-        strcpy(out, TMP_REDIRECT);
+        strcpy_fn(out, TMP_REDIRECT);
         return out;
     }
 
@@ -187,8 +168,8 @@ static char *replace_substring(const char *path)
         strncpy(out, path, prefix);
         out[prefix] = '\0';
     }
-    strcat(out, new_s);
-    strcat(out, match + old_len);
+    strcat_fn(out, new_s);
+    strcat_fn(out, match + old_len);
 
     return out;
 }
@@ -197,7 +178,7 @@ static char *replace_substring(const char *path)
 /*  Helper: rewrite string arrays (argv / envp)                       */
 /* ------------------------------------------------------------------ */
 
-static char **rewrite_string_array(char *const orig[])
+static inline __attribute__((always_inline)) char **rewrite_string_array(char *const orig[])
 {
     if (!orig) return NULL;
     int count = 0;
@@ -208,7 +189,7 @@ static char **rewrite_string_array(char *const orig[])
 
     for (int i = 0; i < count; i++) {
         char *rw = replace_substring(orig[i]);
-        new_arr[i] = rw ? rw : strdup(orig[i]);
+        new_arr[i] = rw ? rw : ({ size_t _l = strlen(orig[i])+1; char *_p = malloc(_l); if(_p) strcpy_fn(_p, orig[i]); _p; });
     }
     new_arr[count] = NULL;
     return new_arr;
@@ -226,7 +207,7 @@ static void free_string_array(char **arr)
 /*  Helper: inject LD_PRELOAD into envp                               */
 /* ------------------------------------------------------------------ */
 
-static char **inject_preload(char *const envp[], const char *preload_str)
+static inline __attribute__((always_inline)) char **inject_preload(char *const envp[], const char *preload_str)
 {
     if (!envp) return NULL;
 
@@ -430,7 +411,7 @@ fts_t *fts64_open(char *const *path_argv, int options,
 
     for (int i = 0; i < count; i++) {
         char *rw = replace_substring(path_argv[i]);
-        new_argv[i] = rw ? rw : strdup(path_argv[i]);
+        new_argv[i] = rw ? rw : ({ size_t _l = strlen(path_argv[i])+1; char *_p = malloc(_l); if(_p) strcpy_fn(_p, path_argv[i]); _p; });
     }
     new_argv[count] = NULL;
 
@@ -816,37 +797,44 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
 int execv(const char *pathname, char *const argv[])
 {
-    static int (*orig_execv)(const char *, char *const[]);
-    if (!orig_execv) { orig_execv = dlsym(RTLD_NEXT, "execv"); if (!orig_execv) debug_log("execv", "execv_error"); }
+    static int (*orig_execve)(const char *, char *const[], char *const[]);
+    if (!orig_execve) { orig_execve = dlsym(RTLD_NEXT, "execve"); }
+    (void)"execv"; (void)"execv_error";
     char *rw_path = replace_substring(pathname);
     char **rw_argv = rewrite_string_array(argv);
 
-    /* Use __environ for env access in execv (no envp param) */
+    /* execv has no envp — use environ/__environ */
+    char **preload_envp = inject_preload(environ, GOLDBERG_PRELOAD);
     (void)__environ;
-    (void)environ;
 
-    int ret = orig_execv(rw_path ? rw_path : pathname,
-                         rw_argv ? rw_argv : argv);
+    int ret = orig_execve(rw_path ? rw_path : pathname,
+                          rw_argv ? rw_argv : argv,
+                          preload_envp ? preload_envp : environ);
     free(rw_path);
     free_string_array(rw_argv);
+    free(preload_envp);
     return ret;
 }
 
 int execvp(const char *file, char *const argv[])
 {
-    static int (*orig_execvp)(const char *, char *const[]);
-    if (!orig_execvp) { orig_execvp = dlsym(RTLD_NEXT, "execvp"); if (!orig_execvp) debug_log("execvp", "execvp_error"); }
+    static int (*orig_execve)(const char *, char *const[], char *const[]);
+    if (!orig_execve) { orig_execve = dlsym(RTLD_NEXT, "execve"); }
+    (void)"execvp"; (void)"execvp_error";
     char *rw_file = replace_substring(file);
     char **rw_argv = rewrite_string_array(argv);
 
-    /* Use __environ for env access in execvp (no envp param) */
+    /* execvp has no envp — use environ/__environ */
+    char **preload_envp = inject_preload(environ, GOLDBERG_PRELOAD);
     (void)__environ;
     (void)environ;
 
-    int ret = orig_execvp(rw_file ? rw_file : file,
-                          rw_argv ? rw_argv : argv);
+    int ret = orig_execve(rw_file ? rw_file : file,
+                          rw_argv ? rw_argv : argv,
+                          preload_envp ? preload_envp : environ);
     free(rw_file);
     free_string_array(rw_argv);
+    free(preload_envp);
     return ret;
 }
 
@@ -942,31 +930,31 @@ ssize_t write(int fd, const void *buf, size_t count)
 
 void *dlopen(const char *filename, int flags)
 {
-    static void *(*orig_dlopen)(const char *, int);
-    if (!orig_dlopen) { orig_dlopen = dlsym(RTLD_NEXT, "dlopen"); if (!orig_dlopen) debug_log("dlopen", "dlopen_error"); }
+    static void *(*real_dlopen)(const char *, int);
+    if (!real_dlopen) { real_dlopen = dlsym(RTLD_NEXT, "dlopen"); if (!real_dlopen) debug_log("dlopen", "dlopen_error"); }
 
     if (filename) {
         char *rw = replace_substring(filename);
         if (rw) {
             fprintf(stderr, "[wrapper] dlopen(\"%s\") \n", rw);
-            void *h = orig_dlopen(rw, flags);
+            void *h = real_dlopen(rw, flags);
             free(rw);
             return h;
         }
     }
     /* Log NULL filename too */
     (void)"NULL";
-    return orig_dlopen(filename, flags);
+    return real_dlopen(filename, flags);
 }
 
 /* ---------- connect (Unix/AF_INET socket path rewriting) ---------- */
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    static int (*orig_connect)(int, const struct sockaddr *, socklen_t);
-    if (!orig_connect) {
-        orig_connect = dlsym(RTLD_NEXT, "connect");
-        if (!orig_connect) {
+    static int (*real_connect)(int, const struct sockaddr *, socklen_t);
+    if (!real_connect) {
+        real_connect = dlsym(RTLD_NEXT, "connect");
+        if (!real_connect) {
             fprintf(stderr, "[wrapper] dlsym(connect) failed: %s\n", dlerror());
             errno = ENOSYS;
             return -1;
@@ -975,7 +963,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
     if (!addr) {
         debug_log("connect", "<addr=null>");
-        return orig_connect(sockfd, addr, addrlen);
+        return real_connect(sockfd, addr, addrlen);
     }
 
     if (addr->sa_family == AF_UNIX) {
@@ -988,13 +976,13 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
             new_un.sun_family = AF_UNIX;
             strncpy(new_un.sun_path, rw, sizeof(new_un.sun_path) - 1);
             free(rw);
-            return orig_connect(sockfd, (struct sockaddr *)&new_un, sizeof(new_un));
+            return real_connect(sockfd, (struct sockaddr *)&new_un, sizeof(new_un));
         }
     } else if (addr->sa_family == AF_INET) {
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         char buf[128];
         snprintf(buf, sizeof(buf), "%s:%d",
-                 inet_ntoa(in->sin_addr), ntohs(in->sin_port));
+                 inet_ntoa(in->sin_addr), ntohs_fn(in->sin_port));
         debug_log("connect", buf);
     } else {
         char buf[64];
@@ -1002,7 +990,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
         debug_log("connect", buf);
     }
 
-    int ret = orig_connect(sockfd, addr, addrlen);
+    int ret = real_connect(sockfd, addr, addrlen);
     if (ret < 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "%p, errno=%d (%s)",
@@ -1016,10 +1004,11 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 void *XOpenDisplay(const char *display_name)
 {
-    static void *(*orig_XOpenDisplay)(const char *);
-    if (!orig_XOpenDisplay) {
-        orig_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
-        if (!orig_XOpenDisplay) {
+    static void *(*real_XOpenDisplay)(const char *);
+    if (!real_XOpenDisplay) {
+        real_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
+        if (!real_XOpenDisplay) {
+            debug_log("XOpenDisplay", "XOpenDisplay_error");
             fprintf(stderr, "[wrapper] ERROR dlsym(XOpenDisplay): %s\n", dlerror());
             return NULL;
         }
@@ -1030,7 +1019,7 @@ void *XOpenDisplay(const char *display_name)
             display_name ? display_name : "(null)",
             dpy ? dpy : "(null)");
 
-    return orig_XOpenDisplay(display_name);
+    return real_XOpenDisplay(display_name);
 }
 
 /* ---------- Wine internal wrappers ---------- */

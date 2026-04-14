@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p out
           DATA_PREFIX="/data/data/${{ env.NEW_SUB }}/files/imagefs"
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wno-unused-function -Wno-unused-const-variable \
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wno-unused-function -Wno-unused-const-variable -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
             -DOLD_SUB='"${{ env.OLD_SUB }}"' \
             -DNEW_SUB='"${{ env.NEW_SUB }}"' \
             -DOLD_SUB_LONG='"${{ env.OLD_SUB_LONG }}"' \
