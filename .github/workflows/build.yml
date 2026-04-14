@@ -177,7 +177,10 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "libredirect (${{ steps.tag.outputs.pkg }}) ${{ steps.tag.outputs.tag }}"
-          generate_release_notes: true
+          body: |
+            **Package:** `${{ steps.tag.outputs.pkg }}`
+            **Built from:** [`${{ github.sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+            **Build run:** [Actions #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           make_latest: true
           files: |
             out/libredirect.so
