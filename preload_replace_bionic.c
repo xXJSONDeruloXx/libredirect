@@ -73,7 +73,7 @@ static void log_wrap(const char *tag, const char *from, const char *to)
 /* ------------------------------------------------------------------ */
 
 static int (*real_open)(const char *, int, ...);
-static int (*real_ioctl)(int, unsigned long, ...);
+static int (*real_ioctl)(int, int, ...);
 static ssize_t (*real_read)(int, void *, size_t);
 static int (*real_openat)(int, const char *, int, ...);
 static int (*real_fstatat)(int, const char *, struct stat *, int);
@@ -247,8 +247,11 @@ ssize_t read(int fd, void *buf, size_t count)
 /*
  * ioctl() — intercepts EVIOCGNAME on /dev/input/event* fds.
  * Rewrites the device name if it contains old_pkg.
+ *
+ * Bionic declares ioctl with `int __op` and the `overloadable` attribute,
+ * so we must match that signature exactly.
  */
-int ioctl(int fd, unsigned long request, ...)
+int ioctl(int fd, int request, ...)
 {
     RESOLVE(ioctl);
     va_list ap;
@@ -259,8 +262,9 @@ int ioctl(int fd, unsigned long request, ...)
     int ret = real_ioctl(fd, request, arg);
 
     /* EVIOCGNAME returns the device name as a string in arg */
-    if (ret >= 0 && is_event_node(fd) && _IOC_TYPE(request) == 'E' &&
-        _IOC_NR(request) == (_IOC_NR(EVIOCGNAME(0)))) {
+    unsigned long ureq = (unsigned long)(unsigned int)request;
+    if (ret >= 0 && is_event_node(fd) && _IOC_TYPE(ureq) == 'E' &&
+        _IOC_NR(ureq) == (_IOC_NR(EVIOCGNAME(0)))) {
         char *name = (char *)arg;
         char *match = strstr(name, old_pkg);
         if (match) {
