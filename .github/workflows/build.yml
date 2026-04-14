@@ -1,0 +1,185 @@
+name: Build libredirect
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      old_sub:
+        description: "Old package (short)"
+        default: "com.winlator"
+      new_sub:
+        description: "New package (short)"
+        default: "app.gnlime"
+      old_sub_long:
+        description: "Old package path"
+        default: "com.winlator/files/rootfs"
+      new_sub_long:
+        description: "New package path"
+        default: "app.gnlime/files/imagefs"
+
+permissions:
+  contents: write
+
+env:
+  OLD_SUB:      ${{ inputs.old_sub      || 'com.winlator' }}
+  NEW_SUB:      ${{ inputs.new_sub      || 'app.gnlime' }}
+  OLD_SUB_LONG: ${{ inputs.old_sub_long || 'com.winlator/files/rootfs' }}
+  NEW_SUB_LONG: ${{ inputs.new_sub_long || 'app.gnlime/files/imagefs' }}
+
+jobs:
+  build-glibc:
+    name: Build libredirect.so (GLIBC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          mkdir -p out
+          DATA_PREFIX="/data/data/${{ env.NEW_SUB }}/files/imagefs"
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wno-unused-function -Wno-unused-const-variable \
+            -DOLD_SUB='"${{ env.OLD_SUB }}"' \
+            -DNEW_SUB='"${{ env.NEW_SUB }}"' \
+            -DOLD_SUB_LONG='"${{ env.OLD_SUB_LONG }}"' \
+            -DNEW_SUB_LONG='"${{ env.NEW_SUB_LONG }}"' \
+            -DGOLDBERG_PRELOAD='"LD_PRELOAD='"$DATA_PREFIX"'/libpluviagoldberg.so"' \
+            -DTMP_REDIRECT='"'"$DATA_PREFIX"'/usr/tmp"' \
+            -DPRELOAD_MARKER='"'"$DATA_PREFIX"'/preload_loaded.txt"' \
+            -o out/libredirect.so preload_replace.c -ldl
+
+      - name: Inspect symbols
+        run: |
+          echo "=== Exported symbols ==="
+          aarch64-linux-gnu-nm -D out/libredirect.so | grep -E '^[0-9a-f]+ T ' | awk '{print $3}' | sort
+          echo ""
+          echo "=== File info ==="
+          file out/libredirect.so
+          ls -la out/libredirect.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libredirect-glibc
+          path: out/libredirect.so
+
+  build-bionic:
+    name: Build libredirect-bionic.so (NDK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Find NDK clang
+        id: ndk
+        run: |
+          # Find the NDK clang installed by setup-android
+          CLANG=$(find $ANDROID_HOME/ndk -name 'aarch64-linux-android*-clang' -not -name '*++' | sort -V | tail -1)
+          if [ -z "$CLANG" ]; then
+            echo "NDK clang not found, installing NDK..."
+            sdkmanager --install "ndk;28.0.12674087"
+            CLANG=$(find $ANDROID_HOME/ndk -name 'aarch64-linux-android*-clang' -not -name '*++' | sort -V | tail -1)
+          fi
+          echo "clang=$CLANG" >> "$GITHUB_OUTPUT"
+          echo "Using: $CLANG"
+          $CLANG --version
+
+      - name: Build
+        run: |
+          mkdir -p out
+          # Bionic version uses OLD_PKG/NEW_PKG (short form — rewrites com.winlator.cmod)
+          ${{ steps.ndk.outputs.clang }} -shared -fPIC -O2 -Wall -DNDEBUG \
+            -DOLD_PKG='"${{ env.OLD_SUB }}.cmod"' \
+            -DNEW_PKG='"${{ env.NEW_SUB }}"' \
+            -o out/libredirect-bionic.so preload_replace_bionic.c -ldl
+
+      - name: Inspect symbols
+        run: |
+          echo "=== Exported symbols ==="
+          nm -D out/libredirect-bionic.so | grep -E '^[0-9a-f]+ T ' | awk '{print $3}' | sort
+          echo ""
+          echo "=== File info ==="
+          file out/libredirect-bionic.so
+          ls -la out/libredirect-bionic.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libredirect-bionic
+          path: out/libredirect-bionic.so
+
+  package:
+    name: Package redirect.tzst
+    needs: [ build-glibc, build-bionic ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: libredirect-glibc
+          path: pkg/usr/lib
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libredirect-bionic
+          path: pkg/usr/lib
+
+      - name: Create redirect.tzst
+        run: |
+          sudo apt-get install -y -qq zstd
+          tar -C pkg -cf - usr/ | zstd -o redirect.tzst
+          echo "=== Contents ==="
+          tar -tf redirect.tzst 2>/dev/null || zstd -d redirect.tzst -o /tmp/r.tar && tar -tf /tmp/r.tar
+          ls -la redirect.tzst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redirect-tzst
+          path: redirect.tzst
+
+  release:
+    name: Create release
+    needs: [ package, build-glibc, build-bionic ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libredirect-glibc
+          path: out
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libredirect-bionic
+          path: out
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: redirect-tzst
+          path: out
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TAG="build-${SHORT_SHA}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "libredirect ${{ steps.tag.outputs.tag }}"
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            out/libredirect.so
+            out/libredirect-bionic.so
+            out/redirect.tzst
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
