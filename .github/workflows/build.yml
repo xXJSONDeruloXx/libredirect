@@ -143,7 +143,7 @@ jobs:
   release:
     name: Create release
     needs: [ package, build-glibc, build-bionic ]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -167,14 +167,16 @@ jobs:
         id: tag
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          TAG="build-${SHORT_SHA}"
+          PKG="${{ env.NEW_SUB }}"
+          TAG="${PKG}-${SHORT_SHA}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: "libredirect ${{ steps.tag.outputs.tag }}"
+          name: "libredirect (${{ steps.tag.outputs.pkg }}) ${{ steps.tag.outputs.tag }}"
           generate_release_notes: true
           make_latest: true
           files: |
