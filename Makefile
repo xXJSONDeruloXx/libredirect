@@ -40,7 +40,7 @@ GLIBC_CFLAGS  = -shared -fPIC -O2 -Wall -Wno-unused-function \
 	-DTMP_REDIRECT='"$(DATA_PREFIX)/usr/tmp"' \
 	-DPRELOAD_MARKER='"$(DATA_PREFIX)/preload_loaded.txt"'
 
-BIONIC_CFLAGS = -shared -fPIC -O2 -Wall -DNDEBUG \
+BIONIC_CFLAGS = -shared -fPIC -O2 -Wall \
 	-DOLD_PKG='"$(OLD_SUB)"' \
 	-DNEW_PKG='"$(NEW_SUB)"'
 

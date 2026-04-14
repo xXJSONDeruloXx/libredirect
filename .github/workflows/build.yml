@@ -93,7 +93,7 @@ jobs:
         run: |
           mkdir -p out
           # Bionic version uses OLD_PKG/NEW_PKG (short form — rewrites com.winlator.cmod)
-          ${{ steps.ndk.outputs.clang }} -shared -fPIC -O2 -Wall -DNDEBUG \
+          ${{ steps.ndk.outputs.clang }} -shared -fPIC -O2 -Wall \
             -DOLD_PKG='"${{ env.OLD_SUB }}.cmod"' \
             -DNEW_PKG='"${{ env.NEW_SUB }}"' \
             -o out/libredirect-bionic.so preload_replace_bionic.c -ldl
@@ -132,7 +132,7 @@ jobs:
           sudo apt-get install -y -qq zstd
           tar -C pkg -cf - usr/ | zstd -o redirect.tzst
           echo "=== Contents ==="
-          tar -tf redirect.tzst 2>/dev/null || zstd -d redirect.tzst -o /tmp/r.tar && tar -tf /tmp/r.tar
+          tar --zstd -tf redirect.tzst
           ls -la redirect.tzst
 
       - uses: actions/upload-artifact@v4

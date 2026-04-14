@@ -88,7 +88,12 @@ static const char *new_sub_long = NEW_SUB_LONG;
 /*  Debug logging                                                     */
 /* ------------------------------------------------------------------ */
 
-#if 0 /* Enable for debugging — writes to stderr via fprintf */
+/*
+ * debug_log exists in the original binary (symbol "debug_log") but is
+ * only called from the [wrapper] paths (dlopen, connect, XOpenDisplay).
+ * We keep it unconditionally compiled so the symbol and format strings
+ * are present in the .so, matching the original.
+ */
 static void debug_log(const char *fmt, ...)
 {
     FILE *err = stderr;
@@ -98,10 +103,6 @@ static void debug_log(const char *fmt, ...)
     vfprintf(err, fmt, ap);
     va_end(ap);
 }
-#define DBG(...) debug_log(__VA_ARGS__)
-#else
-#define DBG(...) ((void)0)
-#endif
 
 /* ------------------------------------------------------------------ */
 /*  Core path rewriter                                                */
@@ -115,30 +116,10 @@ static void debug_log(const char *fmt, ...)
  * Returns a malloc'd string if a substitution was made, or NULL if
  * the path doesn't contain either substring.  Caller must free().
  */
-static char *replace_substring(const char *path)
+/* Substitute `old_s` with `new_s` at position `match` within `path` */
+static char *do_replace(const char *path, const char *match,
+                        const char *old_s, const char *new_s)
 {
-    if (!path)
-        return NULL;
-
-    const char *old_s;
-    const char *new_s;
-    const char *match;
-
-    /* Try long form first */
-    match = strstr(path, old_sub_long);
-    if (match) {
-        old_s = old_sub_long;
-        new_s = new_sub_long;
-    } else {
-        match = strstr(path, old_sub);
-        if (match) {
-            old_s = old_sub;
-            new_s = new_sub;
-        } else {
-            return NULL;
-        }
-    }
-
     size_t old_len  = strlen(old_s);
     size_t new_len  = strlen(new_s);
     size_t path_len = strlen(path);
@@ -154,6 +135,26 @@ static char *replace_substring(const char *path)
            path_len - prefix - old_len + 1);
 
     return out;
+}
+
+static char *replace_substring(const char *path)
+{
+    if (!path)
+        return NULL;
+
+    const char *match;
+
+    /* Try long form first: com.winlator/files/rootfs → pkg/files/imagefs */
+    match = strstr(path, old_sub_long);
+    if (match)
+        return do_replace(path, match, old_sub_long, new_sub_long);
+
+    /* Short form: com.winlator → pkg */
+    match = strstr(path, old_sub);
+    if (match)
+        return do_replace(path, match, old_sub, new_sub);
+
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -270,10 +271,16 @@ ORIG(void *, my_XOpenDisplay)(const char *);
  * Three copies of the preload string in the data segment, matching
  * the original binary layout.  Used by execve/posix_spawn wrappers
  * to inject LD_PRELOAD into child processes.
+ *
+ * The original binary has these as separate static arrays in each
+ * exec wrapper function; we mirror that with file-scope arrays.
  */
 static const char preload_env_1[] = GOLDBERG_PRELOAD;
 static const char preload_env_2[] = GOLDBERG_PRELOAD;
 static const char preload_env_3[] = GOLDBERG_PRELOAD;
+
+/* Prefix used to detect existing LD_PRELOAD in envp */
+static const char ld_preload_prefix[] = "LD_PRELOAD=";
 
 /* ------------------------------------------------------------------ */
 /*  Constructor: create marker file on first load                     */
@@ -789,6 +796,48 @@ static void free_string_array(char **arr)
     free(arr);
 }
 
+/*
+ * Build an envp with LD_PRELOAD for the Goldberg Steam emulation shim.
+ * If LD_PRELOAD already exists in the environment, replace it;
+ * otherwise append a new entry.  The caller must free the returned
+ * array (but NOT the individual strings — they alias the originals
+ * except for the injected entry).
+ *
+ * The `preload_str` parameter selects which of the three preload_env
+ * copies to use, matching the original binary's per-function layout.
+ */
+static char **inject_preload(char *const envp[], const char *preload_str)
+{
+    if (!envp) return NULL;
+
+    int count = 0;
+    int preload_idx = -1;
+    while (envp[count]) {
+        if (strncmp(envp[count], ld_preload_prefix, sizeof(ld_preload_prefix) - 1) == 0)
+            preload_idx = count;
+        count++;
+    }
+
+    /* +2: room for a possible new entry + NULL terminator */
+    char **new_envp = malloc(sizeof(char *) * (count + 2));
+    if (!new_envp) return NULL;
+
+    for (int i = 0; i < count; i++)
+        new_envp[i] = envp[i];
+
+    if (preload_idx >= 0) {
+        /* Replace existing LD_PRELOAD */
+        new_envp[preload_idx] = (char *)preload_str;
+        new_envp[count] = NULL;
+    } else {
+        /* Append LD_PRELOAD */
+        new_envp[count] = (char *)preload_str;
+        new_envp[count + 1] = NULL;
+    }
+
+    return new_envp;
+}
+
 int execve(const char *pathname, char *const argv[], char *const envp[])
 {
     RESOLVE(execve);
@@ -796,12 +845,24 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
 
-    int ret = orig_execve(rw_path ? rw_path : pathname,
+    /* Inject Goldberg LD_PRELOAD — skip for wineserver (it manages its own env) */
+    const char *exec_name = rw_path ? rw_path : pathname;
+    const char *base = strrchr(exec_name, '/');
+    base = base ? base + 1 : exec_name;
+    char **preload_envp = NULL;
+    if (strcmp(base, "wineserver") != 0) {
+        preload_envp = inject_preload(
+            rw_envp ? (char *const *)rw_envp : envp, preload_env_1);
+    }
+
+    int ret = orig_execve(exec_name,
                           rw_argv ? rw_argv : argv,
+                          preload_envp ? preload_envp :
                           rw_envp ? rw_envp : envp);
     free(rw_path);
     free_string_array(rw_argv);
     free_string_array(rw_envp);
+    free(preload_envp);
     return ret;
 }
 
@@ -837,13 +898,18 @@ int posix_spawn(pid_t *pid, const char *path,
     char *rw_path = replace_substring(path);
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
+    char **preload_envp = inject_preload(
+        rw_envp ? (char *const *)rw_envp : envp, preload_env_2);
+
     int ret = orig_posix_spawn(pid, rw_path ? rw_path : path,
                                file_actions, attrp,
                                rw_argv ? rw_argv : argv,
+                               preload_envp ? preload_envp :
                                rw_envp ? rw_envp : envp);
     free(rw_path);
     free_string_array(rw_argv);
     free_string_array(rw_envp);
+    free(preload_envp);
     return ret;
 }
 
@@ -855,13 +921,18 @@ int posix_spawnp(pid_t *pid, const char *file,
     char *rw_file = replace_substring(file);
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
+    char **preload_envp = inject_preload(
+        rw_envp ? (char *const *)rw_envp : envp, preload_env_3);
+
     int ret = orig_posix_spawnp(pid, rw_file ? rw_file : file,
                                 file_actions, attrp,
                                 rw_argv ? rw_argv : argv,
+                                preload_envp ? preload_envp :
                                 rw_envp ? rw_envp : envp);
     free(rw_file);
     free_string_array(rw_argv);
     free_string_array(rw_envp);
+    free(preload_envp);
     return ret;
 }
 
@@ -907,7 +978,7 @@ void *dlopen(const char *filename, int flags)
     if (filename) {
         char *rw = replace_substring(filename);
         if (rw) {
-            DBG("[wrapper] dlopen(\"%s\") \n", rw);
+            debug_log("[wrapper] dlopen(\"%s\") \n", rw);
             void *h = real_dlopen(rw, flags);
             free(rw);
             return h;
@@ -920,8 +991,14 @@ void *dlopen(const char *filename, int flags)
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    if (!real_connect)
+    if (!real_connect) {
         real_connect = dlsym(RTLD_NEXT, "connect");
+        if (!real_connect) {
+            debug_log("[wrapper] dlsym(connect) failed: %s\n", dlerror());
+            errno = ENOSYS;
+            return -1;
+        }
+    }
 
     if (addr && addr->sa_family == AF_UNIX) {
         struct sockaddr_un *un = (struct sockaddr_un *)addr;
@@ -945,14 +1022,14 @@ void *XOpenDisplay(const char *display_name)
     if (!real_XOpenDisplay) {
         real_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
         if (!real_XOpenDisplay) {
-            DBG("[wrapper] ERROR dlsym(XOpenDisplay): %s\n", dlerror());
+            debug_log("[wrapper] ERROR dlsym(XOpenDisplay): %s\n", dlerror());
             return NULL;
         }
     }
 
-    DBG("[wrapper] XOpenDisplay(\"%s\")  getenv(DISPLAY)=\"%s\"  \n",
-        display_name ? display_name : "NULL",
-        getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
+    debug_log("[wrapper] XOpenDisplay(\"%s\")  getenv(DISPLAY)=\"%s\"  \n",
+              display_name ? display_name : "NULL",
+              getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
 
     return real_XOpenDisplay(display_name);
 }
