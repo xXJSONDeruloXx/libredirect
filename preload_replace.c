@@ -91,6 +91,12 @@ static uint16_t (*volatile ntohs_fn)(uint16_t) = ntohs;
 static char ** volatile *environ_ref      = &environ;
 static char ** volatile *__environ_ref    = &__environ;
 
+/* dlopen/connect/XOpenDisplay use file-scope pointers ("real_*" not "orig_*")
+ * matching the original binary's symbol names */
+static void *(*real_dlopen)(const char *, int);
+static int   (*real_connect)(int, const struct sockaddr *, socklen_t);
+static void *(*real_XOpenDisplay)(const char *);
+
 /* extern environ declarations — used by execv/execvp */
 extern char **__environ;
 extern char **environ;
@@ -120,15 +126,19 @@ static char *replace_substring(const char *path)
     if (!path)
         return NULL;
 
-    /* /tmp -> TMP_REDIRECT */
-    if (strcmp(path, "/tmp") == 0) {
-        size_t len = strlen(TMP_REDIRECT);
-        char *out = malloc(len + 1);
+    /* /tmp and /tmp/... -> TMP_REDIRECT and TMP_REDIRECT/... */
+    if (path[0] == '/' && path[1] == 't' && path[2] == 'm' && path[3] == 'p' &&
+        (path[4] == '\0' || path[4] == '/')) {
+        const char *suffix = path + 4; /* "" or "/..." */
+        size_t redir_len = strlen(TMP_REDIRECT);
+        size_t suffix_len = strlen(suffix);
+        char *out = malloc(redir_len + suffix_len + 1);
         if (!out) {
             debug_log("replace_substring", "malloc failed");
             return NULL;
         }
         strcpy_fn(out, TMP_REDIRECT);
+        strcat_fn(out, suffix);
         return out;
     }
 
@@ -797,19 +807,26 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
 int execv(const char *pathname, char *const argv[])
 {
-    static int (*orig_execve)(const char *, char *const[], char *const[]);
-    if (!orig_execve) { orig_execve = dlsym(RTLD_NEXT, "execve"); }
-    (void)"execv"; (void)"execv_error";
+    static int (*orig_execv)(const char *, char *const[]);
+    if (!orig_execv) { orig_execv = dlsym(RTLD_NEXT, "execv"); if (!orig_execv) debug_log("execv", "execv_error"); }
     char *rw_path = replace_substring(pathname);
     char **rw_argv = rewrite_string_array(argv);
 
-    /* execv has no envp — use environ/__environ */
+    /*
+     * execv has no envp param — it uses the process environ.
+     * Inject LD_PRELOAD into environ before calling through.
+     * Reference both environ and __environ for symbol parity.
+     */
+    char **saved_environ = environ;
     char **preload_envp = inject_preload(environ, GOLDBERG_PRELOAD);
+    if (preload_envp) environ = preload_envp;
     (void)__environ;
 
-    int ret = orig_execve(rw_path ? rw_path : pathname,
-                          rw_argv ? rw_argv : argv,
-                          preload_envp ? preload_envp : environ);
+    int ret = orig_execv(rw_path ? rw_path : pathname,
+                         rw_argv ? rw_argv : argv);
+
+    /* exec only returns on failure — restore environ */
+    environ = saved_environ;
     free(rw_path);
     free_string_array(rw_argv);
     free(preload_envp);
@@ -818,20 +835,25 @@ int execv(const char *pathname, char *const argv[])
 
 int execvp(const char *file, char *const argv[])
 {
-    static int (*orig_execve)(const char *, char *const[], char *const[]);
-    if (!orig_execve) { orig_execve = dlsym(RTLD_NEXT, "execve"); }
-    (void)"execvp"; (void)"execvp_error";
+    static int (*orig_execvp)(const char *, char *const[]);
+    if (!orig_execvp) { orig_execvp = dlsym(RTLD_NEXT, "execvp"); if (!orig_execvp) debug_log("execvp", "execvp_error"); }
     char *rw_file = replace_substring(file);
     char **rw_argv = rewrite_string_array(argv);
 
-    /* execvp has no envp — use environ/__environ */
+    /*
+     * execvp has no envp param — it uses the process environ and
+     * searches PATH.  Inject LD_PRELOAD into environ before calling.
+     */
+    char **saved_environ = environ;
     char **preload_envp = inject_preload(environ, GOLDBERG_PRELOAD);
+    if (preload_envp) environ = preload_envp;
     (void)__environ;
-    (void)environ;
 
-    int ret = orig_execve(rw_file ? rw_file : file,
-                          rw_argv ? rw_argv : argv,
-                          preload_envp ? preload_envp : environ);
+    int ret = orig_execvp(rw_file ? rw_file : file,
+                          rw_argv ? rw_argv : argv);
+
+    /* exec only returns on failure — restore environ */
+    environ = saved_environ;
     free(rw_file);
     free_string_array(rw_argv);
     free(preload_envp);
@@ -930,7 +952,6 @@ ssize_t write(int fd, const void *buf, size_t count)
 
 void *dlopen(const char *filename, int flags)
 {
-    static void *(*real_dlopen)(const char *, int);
     if (!real_dlopen) { real_dlopen = dlsym(RTLD_NEXT, "dlopen"); if (!real_dlopen) debug_log("dlopen", "dlopen_error"); }
 
     if (filename) {
@@ -951,7 +972,6 @@ void *dlopen(const char *filename, int flags)
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    static int (*real_connect)(int, const struct sockaddr *, socklen_t);
     if (!real_connect) {
         real_connect = dlsym(RTLD_NEXT, "connect");
         if (!real_connect) {
@@ -1004,7 +1024,6 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 void *XOpenDisplay(const char *display_name)
 {
-    static void *(*real_XOpenDisplay)(const char *);
     if (!real_XOpenDisplay) {
         real_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
         if (!real_XOpenDisplay) {
