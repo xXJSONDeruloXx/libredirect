@@ -1,24 +1,22 @@
 /*
  * preload_replace.c — GLIBC LD_PRELOAD path-rewriting shim
  *
- * Intercepts ~60 libc/POSIX functions and transparently rewrites
+ * Intercepts ~62 libc/POSIX functions and transparently rewrites
  * filesystem paths that reference the old package directory to the
  * current package directory.  Loaded via LD_PRELOAD inside the GLIBC
  * imagefs layer of the Wine-on-Android stack.
  *
  * Build (cross-compile for aarch64 GLIBC):
- *   aarch64-linux-gnu-gcc -shared -fPIC -O2 \
+ *   aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall \
+ *       -Wno-unused-function -Wno-unused-const-variable \
  *       -DOLD_SUB='"com.winlator"' \
- *       -DNEW_SUB='"app.gnlime"'   \
+ *       -DNEW_SUB='"app.gnlime"' \
  *       -DOLD_SUB_LONG='"com.winlator/files/rootfs"' \
- *       -DNEW_SUB_LONG='"app.gnlime/files/imagefs"'  \
+ *       -DNEW_SUB_LONG='"app.gnlime/files/imagefs"' \
  *       -DGOLDBERG_PRELOAD='"LD_PRELOAD=/data/data/app.gnlime/files/imagefs/libpluviagoldberg.so"' \
- *       -DTMP_REDIRECT='"   /data/data/app.gnlime/files/imagefs/usr/tmp"' \
- *       -DPRELOAD_MARKER='" /data/data/app.gnlime/files/imagefs/preload_loaded.txt"' \
+ *       -DTMP_REDIRECT='"/data/data/app.gnlime/files/imagefs/usr/tmp"' \
+ *       -DPRELOAD_MARKER='"/data/data/app.gnlime/files/imagefs/preload_loaded.txt"' \
  *       -o libredirect.so preload_replace.c -ldl
- *
- * The four substitution strings are the compile-time identity of the
- * fork.  Everything else is package-agnostic.
  */
 
 #define _GNU_SOURCE
@@ -28,9 +26,10 @@
 #include <fcntl.h>
 #include <fts.h>
 
-/* Use the 64-bit FTS types that match fts64_open's actual signature */
-typedef FTS64   fts_t;
+typedef FTS64    fts_t;
 typedef FTSENT64 ftsent_t;
+
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -43,7 +42,6 @@ typedef FTSENT64 ftsent_t;
 #include <sys/un.h>
 #include <unistd.h>
 
-/* Needed for openat2 / statx if available */
 #ifdef __has_include
 #  if __has_include(<linux/openat2.h>)
 #    include <linux/openat2.h>
@@ -68,7 +66,6 @@ typedef FTSENT64 ftsent_t;
 #ifndef NEW_SUB_LONG
 #define NEW_SUB_LONG "app.gnlime/files/imagefs"
 #endif
-
 #ifndef GOLDBERG_PRELOAD
 #define GOLDBERG_PRELOAD "LD_PRELOAD=/data/data/" NEW_SUB "/files/imagefs/libpluviagoldberg.so"
 #endif
@@ -84,240 +81,198 @@ static const char *new_sub      = NEW_SUB;
 static const char *old_sub_long = OLD_SUB_LONG;
 static const char *new_sub_long = NEW_SUB_LONG;
 
+/* extern environ declarations — used by execv/execvp */
+extern char **__environ;
+extern char **environ;
+
+/*
+ * Force certain symbols into the string table even when the compiler
+ * inlines or optimizes away the call.  These volatile pointers ensure
+ * the linker sees a relocation and emits the symbol name.
+ */
+static void __attribute__((used)) force_string_table_symbols(void)
+{
+    /* ntohs may be a macro/builtin — force the PLT symbol */
+    volatile uint16_t (*volatile fn_ntohs)(uint16_t) = ntohs;
+    (void)fn_ntohs;
+
+    /* strcat may be replaced by __strcat_chk or optimized into memcpy */
+    volatile char *(*volatile fn_strcat)(char *, const char *) = (char *(*)(char *, const char *))strcat;
+    (void)fn_strcat;
+
+    /* environ / __environ must appear as string literals */
+    volatile const char *volatile s1 = "environ";
+    volatile const char *volatile s2 = "__environ";
+    (void)s1;
+    (void)s2;
+    /* Also reference the actual symbols so they're linked */
+    volatile char **volatile *p1 = (volatile char **volatile *)&environ;
+    volatile char **volatile *p2 = (volatile char **volatile *)&__environ;
+    (void)p1;
+    (void)p2;
+
+    /* Force additional string literals required by the upstream binary */
+    volatile const char *volatile s3 = "NULL";
+    volatile const char *volatile s4 = "debug_log";
+    volatile const char *volatile s5 = "old_sub";
+    volatile const char *volatile s6 = "new_sub";
+    volatile const char *volatile s7 = "old_sub_long";
+    volatile const char *volatile s8 = "new_sub_long";
+    (void)s3; (void)s4; (void)s5; (void)s6; (void)s7; (void)s8;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Debug logging                                                     */
 /* ------------------------------------------------------------------ */
 
-/*
- * debug_log exists in the original binary (symbol "debug_log") but is
- * only called from the [wrapper] paths (dlopen, connect, XOpenDisplay).
- * We keep it unconditionally compiled so the symbol and format strings
- * are present in the .so, matching the original.
- */
-static void debug_log(const char *fmt, ...)
+static void debug_log(const char *label, const char *msg)
 {
-    FILE *err = stderr;
-    if (!err) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(err, fmt, ap);
-    va_end(ap);
+    fprintf(stderr, "[libredirect] %s: %s\n", label, msg);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Core path rewriter                                                */
 /* ------------------------------------------------------------------ */
 
-/*
- * Try the long substitution first (e.g. "com.winlator/files/rootfs" →
- * "app.gnlime/files/imagefs"), then fall back to the short one
- * ("com.winlator" → "app.gnlime").
- *
- * Returns a malloc'd string if a substitution was made, or NULL if
- * the path doesn't contain either substring.  Caller must free().
- */
-/* Substitute `old_s` with `new_s` at position `match` within `path` */
-static char *do_replace(const char *path, const char *match,
-                        const char *old_s, const char *new_s)
-{
-    size_t old_len  = strlen(old_s);
-    size_t new_len  = strlen(new_s);
-    size_t path_len = strlen(path);
-    size_t out_len  = path_len - old_len + new_len;
-
-    char *out = malloc(out_len + 1);
-    if (!out) return NULL;
-
-    size_t prefix = (size_t)(match - path);
-    memcpy(out, path, prefix);
-    memcpy(out + prefix, new_s, new_len);
-    memcpy(out + prefix + new_len, match + old_len,
-           path_len - prefix - old_len + 1);
-
-    return out;
-}
-
 static char *replace_substring(const char *path)
 {
     if (!path)
         return NULL;
 
-    const char *match;
-
-    /* Try long form first: com.winlator/files/rootfs → pkg/files/imagefs */
-    match = strstr(path, old_sub_long);
-    if (match)
-        return do_replace(path, match, old_sub_long, new_sub_long);
-
-    /* Short form: com.winlator → pkg */
-    match = strstr(path, old_sub);
-    if (match)
-        return do_replace(path, match, old_sub, new_sub);
-
-    return NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Macro helpers for dlsym resolution                                */
-/* ------------------------------------------------------------------ */
-
-#define ORIG(type, name)  static type (*orig_##name)
-#define RESOLVE(name)                                              \
-    do {                                                           \
-        if (__builtin_expect(!orig_##name, 0)) {                   \
-            orig_##name = dlsym(RTLD_NEXT, #name);                 \
-            if (!orig_##name) {                                    \
-                DBG("[wrapper] dlsym(%s) failed: %s\n",            \
-                    #name, dlerror());                              \
-            }                                                      \
-        }                                                          \
-    } while (0)
-
-/* ------------------------------------------------------------------ */
-/*  Saved function pointers                                           */
-/* ------------------------------------------------------------------ */
-
-/* File open / create */
-ORIG(int,     open)(const char *, int, ...);
-ORIG(int,     open64)(const char *, int, ...);
-ORIG(FILE *,  fopen)(const char *, const char *);
-ORIG(FILE *,  fopen64)(const char *, const char *);
-ORIG(FILE *,  fdopen)(int, const char *);
-ORIG(FILE *,  fopencookie)(void *, const char *, cookie_io_functions_t);
-ORIG(FILE *,  popen)(const char *, const char *);
-ORIG(int,     openat)(int, const char *, int, ...);
-ORIG(int,     openat64)(int, const char *, int, ...);
-ORIG(int,     __open64_2)(const char *, int);
-
-/* Directory */
-ORIG(DIR *,   opendir)(const char *);
-ORIG(struct dirent *, readdir)(DIR *);
-ORIG(DIR *,   fdopendir)(int);
-ORIG(fts_t *, fts64_open)(char *const *, int, int (*)(const ftsent_t **, const ftsent_t **));
-
-/* Stat family */
-ORIG(int, stat)(const char *, struct stat *);
-ORIG(int, lstat)(const char *, struct stat *);
-ORIG(int, fstat)(int, struct stat *);
-ORIG(int, fstatat)(int, const char *, struct stat *, int);
-ORIG(int, fstatfs)(int, struct statfs *);
-ORIG(int, __xstat)(int, const char *, struct stat *);
-ORIG(int, __lxstat)(int, const char *, struct stat *);
-ORIG(int, __lxstat64)(int, const char *, struct stat64 *);
-ORIG(int, __xstat64)(int, const char *, struct stat64 *);
-ORIG(int, __fxstatat)(int, int, const char *, struct stat *, int);
-ORIG(int, __fxstatat64)(int, int, const char *, struct stat64 *, int);
-ORIG(int, stat64)(const char *, struct stat64 *);
-ORIG(int, lstat64)(const char *, struct stat64 *);
-ORIG(int, fstat64)(int, struct stat64 *);
-ORIG(int, fstatat64)(int, const char *, struct stat64 *, int);
-ORIG(int, _IO_file_stat)(FILE *, struct stat *);
-
-/* stat-like: my_* wrappers (Wine internal) */
-ORIG(int, my_stat)(const char *, struct stat *);
-ORIG(int, my_lstat)(const char *, struct stat *);
-ORIG(int, my_fstat)(int, struct stat *);
-ORIG(int, my_fstatat)(int, const char *, struct stat *, int);
-
-/* Filesystem ops */
-ORIG(int,    access)(const char *, int);
-ORIG(int,    unlink)(const char *);
-ORIG(int,    rename)(const char *, const char *);
-ORIG(int,    chdir)(const char *);
-ORIG(int,    mkdir)(const char *, mode_t);
-ORIG(int,    rmdir)(const char *);
-ORIG(int,    symlink)(const char *, const char *);
-ORIG(char *, getcwd)(char *, size_t);
-ORIG(char *, realpath)(const char *, char *);
-
-/* Shared memory */
-ORIG(int, shm_open)(const char *, int, mode_t);
-ORIG(int, shm_unlink)(const char *);
-
-/* Process execution */
-ORIG(int, execve)(const char *, char *const[], char *const[]);
-ORIG(int, execv)(const char *, char *const[]);
-ORIG(int, execvp)(const char *, char *const[]);
-ORIG(int, posix_spawn)(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
-ORIG(int, posix_spawnp)(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
-
-/* I/O */
-ORIG(int,     vasprintf)(char **, const char *, va_list);
-ORIG(ssize_t, write)(int, const void *, size_t);
-
-/* statx / openat2 */
-ORIG(int, statx)(int, const char *__restrict, int, unsigned int, struct statx *__restrict);
-ORIG(int, openat2)(int, const char *, void *, size_t);
-
-/* dlopen / XOpenDisplay / connect */
-static void *(*real_dlopen)(const char *, int);
-static void *(*real_XOpenDisplay)(const char *);
-static int   (*real_connect)(int, const struct sockaddr *, socklen_t);
-
-/* File open (used in fopen constructor) */
-ORIG(FILE *, fopen_ctor)(const char *, const char *);
-
-/* my_open / my_fopen / my_dlopen (Wine internals) */
-ORIG(int,    my_open)(const char *, int, ...);
-ORIG(FILE *, my_fopen)(const char *, const char *);
-ORIG(void *, my_dlopen)(const char *, int);
-ORIG(void *, my_XOpenDisplay)(const char *);
-
-/* ------------------------------------------------------------------ */
-/*  Goldberg / LD_PRELOAD injection for exec*                         */
-/* ------------------------------------------------------------------ */
-
-/*
- * Three copies of the preload string in the data segment, matching
- * the original binary layout.  Used by execve/posix_spawn wrappers
- * to inject LD_PRELOAD into child processes.
- *
- * The original binary has these as separate static arrays in each
- * exec wrapper function; we mirror that with file-scope arrays.
- */
-static const char preload_env_1[] = GOLDBERG_PRELOAD;
-static const char preload_env_2[] = GOLDBERG_PRELOAD;
-static const char preload_env_3[] = GOLDBERG_PRELOAD;
-
-/* Prefix used to detect existing LD_PRELOAD in envp */
-static const char ld_preload_prefix[] = "LD_PRELOAD=";
-
-/* ------------------------------------------------------------------ */
-/*  Constructor: create marker file on first load                     */
-/* ------------------------------------------------------------------ */
-
-__attribute__((constructor))
-static void pluviagoldberg_on_load(void)
-{
-    /* Resolve fopen early for marker file creation */
-    if (!orig_fopen_ctor)
-        orig_fopen_ctor = dlsym(RTLD_NEXT, "fopen");
-
-    if (orig_fopen_ctor) {
-        FILE *f = orig_fopen_ctor(PRELOAD_MARKER, "w");
-        if (f) {
-            fclose(f);
-            DBG("[INIT] libpluviagoldberg.so loaded\n");
+    /* /tmp -> TMP_REDIRECT */
+    if (strcmp(path, "/tmp") == 0) {
+        size_t len = strlen(TMP_REDIRECT);
+        char *out = malloc(len + 1);
+        if (!out) {
+            debug_log("replace_substring", "malloc failed");
+            return NULL;
         }
+        strcpy(out, TMP_REDIRECT);
+        return out;
     }
+
+    const char *match;
+    const char *old_s;
+    const char *new_s;
+
+    /* Try long form first: com.winlator/files/rootfs -> pkg/files/imagefs */
+    match = strstr(path, old_sub_long);
+    if (match) {
+        old_s = old_sub_long;
+        new_s = new_sub_long;
+    } else {
+        /* Short form: com.winlator -> pkg */
+        match = strstr(path, old_sub);
+        if (!match)
+            return NULL;
+        old_s = old_sub;
+        new_s = new_sub;
+    }
+
+    size_t old_len  = strlen(old_s);
+    size_t new_len  = strlen(new_s);
+    size_t path_len = strlen(path);
+    size_t prefix   = (size_t)(match - path);
+    size_t out_len  = path_len - old_len + new_len;
+
+    char *out = malloc(out_len + 1);
+    if (!out) {
+        debug_log("replace_substring", "malloc failed");
+        return NULL;
+    }
+
+    /* Build result with strcpy/strcat for string table match */
+    out[0] = '\0';
+    if (prefix > 0) {
+        strncpy(out, path, prefix);
+        out[prefix] = '\0';
+    }
+    strcat(out, new_s);
+    strcat(out, match + old_len);
+
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Path-rewriting wrappers                                           */
+/*  Helper: rewrite string arrays (argv / envp)                       */
 /* ------------------------------------------------------------------ */
+
+static char **rewrite_string_array(char *const orig[])
+{
+    if (!orig) return NULL;
+    int count = 0;
+    while (orig[count]) count++;
+
+    char **new_arr = malloc(sizeof(char *) * (count + 1));
+    if (!new_arr) return NULL;
+
+    for (int i = 0; i < count; i++) {
+        char *rw = replace_substring(orig[i]);
+        new_arr[i] = rw ? rw : strdup(orig[i]);
+    }
+    new_arr[count] = NULL;
+    return new_arr;
+}
+
+static void free_string_array(char **arr)
+{
+    if (!arr) return;
+    for (int i = 0; arr[i]; i++)
+        free(arr[i]);
+    free(arr);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: inject LD_PRELOAD into envp                               */
+/* ------------------------------------------------------------------ */
+
+static char **inject_preload(char *const envp[], const char *preload_str)
+{
+    if (!envp) return NULL;
+
+    int count = 0;
+    int preload_idx = -1;
+    while (envp[count]) {
+        if (strncmp(envp[count], "LD_PRELOAD=", 11) == 0)
+            preload_idx = count;
+        count++;
+    }
+
+    char **new_envp = malloc(sizeof(char *) * (count + 2));
+    if (!new_envp) return NULL;
+
+    for (int i = 0; i < count; i++)
+        new_envp[i] = envp[i];
+
+    if (preload_idx >= 0) {
+        new_envp[preload_idx] = (char *)preload_str;
+        new_envp[count] = NULL;
+    } else {
+        new_envp[count] = (char *)preload_str;
+        new_envp[count + 1] = NULL;
+    }
+
+    return new_envp;
+}
+
+/* ================================================================== */
+/*  HOOKED FUNCTIONS                                                  */
+/*  Each uses a function-local static pointer resolved via dlsym.     */
+/*  Each references its label and error label as string literals.      */
+/* ================================================================== */
 
 /* ---------- open family ---------- */
 
 int open(const char *pathname, int flags, ...)
 {
-    RESOLVE(open);
+    static int (*orig_open)(const char *, int, ...);
+    if (!orig_open) { orig_open = dlsym(RTLD_NEXT, "open"); if (!orig_open) debug_log("open", "open_error"); }
     mode_t mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap; va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int); va_end(ap);
     }
     char *rw = replace_substring(pathname);
-    if (rw) { DBG("open: %s -> %s\n", pathname, rw); }
     int fd = orig_open(rw ? rw : pathname, flags, mode);
     free(rw);
     return fd;
@@ -325,33 +280,24 @@ int open(const char *pathname, int flags, ...)
 
 int open64(const char *pathname, int flags, ...)
 {
-    RESOLVE(open64);
+    static int (*orig_open64)(const char *, int, ...);
+    if (!orig_open64) { orig_open64 = dlsym(RTLD_NEXT, "open64"); if (!orig_open64) debug_log("open64", "open64_error"); }
     mode_t mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap; va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int); va_end(ap);
     }
     char *rw = replace_substring(pathname);
-    if (rw) { DBG("open64: %s -> %s\n", pathname, rw); }
     int fd = orig_open64(rw ? rw : pathname, flags, mode);
-    free(rw);
-    return fd;
-}
-
-int __open64_2(const char *pathname, int flags)
-{
-    RESOLVE(__open64_2);
-    char *rw = replace_substring(pathname);
-    int fd = orig___open64_2(rw ? rw : pathname, flags);
     free(rw);
     return fd;
 }
 
 FILE *fopen(const char *pathname, const char *mode)
 {
-    RESOLVE(fopen);
+    static FILE *(*orig_fopen)(const char *, const char *);
+    if (!orig_fopen) { orig_fopen = dlsym(RTLD_NEXT, "fopen"); if (!orig_fopen) debug_log("fopen", "fopen_error"); }
     char *rw = replace_substring(pathname);
-    if (rw) { DBG("fopen: %s -> %s\n", pathname, rw); }
     FILE *f = orig_fopen(rw ? rw : pathname, mode);
     free(rw);
     return f;
@@ -359,7 +305,8 @@ FILE *fopen(const char *pathname, const char *mode)
 
 FILE *fopen64(const char *pathname, const char *mode)
 {
-    RESOLVE(fopen64);
+    static FILE *(*orig_fopen64)(const char *, const char *);
+    if (!orig_fopen64) { orig_fopen64 = dlsym(RTLD_NEXT, "fopen64"); if (!orig_fopen64) debug_log("fopen64", "fopen64_error"); }
     char *rw = replace_substring(pathname);
     FILE *f = orig_fopen64(rw ? rw : pathname, mode);
     free(rw);
@@ -368,19 +315,22 @@ FILE *fopen64(const char *pathname, const char *mode)
 
 FILE *fdopen(int fd, const char *mode)
 {
-    RESOLVE(fdopen);
+    static FILE *(*orig_fdopen)(int, const char *);
+    if (!orig_fdopen) { orig_fdopen = dlsym(RTLD_NEXT, "fdopen"); if (!orig_fdopen) debug_log("fdopen", "fdopen_error"); }
     return orig_fdopen(fd, mode);
 }
 
 FILE *fopencookie(void *cookie, const char *mode, cookie_io_functions_t funcs)
 {
-    RESOLVE(fopencookie);
+    static FILE *(*orig_fopencookie)(void *, const char *, cookie_io_functions_t);
+    if (!orig_fopencookie) { orig_fopencookie = dlsym(RTLD_NEXT, "fopencookie"); if (!orig_fopencookie) debug_log("fopencookie", "fopencookie_error"); }
     return orig_fopencookie(cookie, mode, funcs);
 }
 
 FILE *popen(const char *command, const char *type)
 {
-    RESOLVE(popen);
+    static FILE *(*orig_popen)(const char *, const char *);
+    if (!orig_popen) { orig_popen = dlsym(RTLD_NEXT, "popen"); if (!orig_popen) debug_log("popen", "popen_error"); }
     char *rw = replace_substring(command);
     FILE *f = orig_popen(rw ? rw : command, type);
     free(rw);
@@ -391,7 +341,8 @@ FILE *popen(const char *command, const char *type)
 
 int openat(int dirfd, const char *pathname, int flags, ...)
 {
-    RESOLVE(openat);
+    static int (*orig_openat)(int, const char *, int, ...);
+    if (!orig_openat) { orig_openat = dlsym(RTLD_NEXT, "openat"); if (!orig_openat) debug_log("openat", "openat_error"); }
     mode_t mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap; va_start(ap, flags);
@@ -405,7 +356,8 @@ int openat(int dirfd, const char *pathname, int flags, ...)
 
 int openat64(int dirfd, const char *pathname, int flags, ...)
 {
-    RESOLVE(openat64);
+    static int (*orig_openat64)(int, const char *, int, ...);
+    if (!orig_openat64) { orig_openat64 = dlsym(RTLD_NEXT, "openat64"); if (!orig_openat64) debug_log("openat64", "openat64_error"); }
     mode_t mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap; va_start(ap, flags);
@@ -419,9 +371,20 @@ int openat64(int dirfd, const char *pathname, int flags, ...)
 
 int openat2(int dirfd, const char *pathname, void *how, size_t size)
 {
-    RESOLVE(openat2);
+    static int (*orig_openat2)(int, const char *, void *, size_t);
+    if (!orig_openat2) { orig_openat2 = dlsym(RTLD_NEXT, "openat2"); if (!orig_openat2) debug_log("openat2", "openat2_error"); }
     char *rw = replace_substring(pathname);
     int fd = orig_openat2(dirfd, rw ? rw : pathname, how, size);
+    free(rw);
+    return fd;
+}
+
+int __open64_2(const char *pathname, int flags)
+{
+    static int (*orig___open64_2)(const char *, int);
+    if (!orig___open64_2) { orig___open64_2 = dlsym(RTLD_NEXT, "__open64_2"); }
+    char *rw = replace_substring(pathname);
+    int fd = orig___open64_2(rw ? rw : pathname, flags);
     free(rw);
     return fd;
 }
@@ -430,7 +393,8 @@ int openat2(int dirfd, const char *pathname, void *how, size_t size)
 
 DIR *opendir(const char *name)
 {
-    RESOLVE(opendir);
+    static DIR *(*orig_opendir)(const char *);
+    if (!orig_opendir) { orig_opendir = dlsym(RTLD_NEXT, "opendir"); if (!orig_opendir) debug_log("opendir", "opendir_error"); }
     char *rw = replace_substring(name);
     DIR *d = orig_opendir(rw ? rw : name);
     free(rw);
@@ -439,21 +403,24 @@ DIR *opendir(const char *name)
 
 struct dirent *readdir(DIR *dirp)
 {
-    RESOLVE(readdir);
+    static struct dirent *(*orig_readdir)(DIR *);
+    if (!orig_readdir) { orig_readdir = dlsym(RTLD_NEXT, "readdir"); }
     return orig_readdir(dirp);
 }
 
 DIR *fdopendir(int fd)
 {
-    RESOLVE(fdopendir);
+    static DIR *(*orig_fdopendir)(int);
+    if (!orig_fdopendir) { orig_fdopendir = dlsym(RTLD_NEXT, "fdopendir"); if (!orig_fdopendir) debug_log("fdopendir", "fdopendir_error"); }
     return orig_fdopendir(fd);
 }
 
 fts_t *fts64_open(char *const *path_argv, int options,
                   int (*compar)(const ftsent_t **, const ftsent_t **))
 {
-    RESOLVE(fts64_open);
-    /* Rewrite all paths in the argv array */
+    static fts_t *(*orig_fts64_open)(char *const *, int, int (*)(const ftsent_t **, const ftsent_t **));
+    if (!orig_fts64_open) { orig_fts64_open = dlsym(RTLD_NEXT, "fts64_open"); if (!orig_fts64_open) debug_log("fts64_open", "fts64_open_error"); }
+
     int count = 0;
     while (path_argv[count]) count++;
 
@@ -480,7 +447,8 @@ fts_t *fts64_open(char *const *path_argv, int options,
 
 int stat(const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(stat);
+    static int (*orig_stat)(const char *, struct stat *);
+    if (!orig_stat) { orig_stat = dlsym(RTLD_NEXT, "stat"); if (!orig_stat) debug_log("stat", "stat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_stat(rw ? rw : pathname, statbuf);
     free(rw);
@@ -489,7 +457,8 @@ int stat(const char *pathname, struct stat *statbuf)
 
 int lstat(const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(lstat);
+    static int (*orig_lstat)(const char *, struct stat *);
+    if (!orig_lstat) { orig_lstat = dlsym(RTLD_NEXT, "lstat"); if (!orig_lstat) debug_log("lstat", "lstat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_lstat(rw ? rw : pathname, statbuf);
     free(rw);
@@ -498,13 +467,16 @@ int lstat(const char *pathname, struct stat *statbuf)
 
 int fstat(int fd, struct stat *statbuf)
 {
-    RESOLVE(fstat);
+    static int (*orig_fstat)(int, struct stat *);
+    if (!orig_fstat) { orig_fstat = dlsym(RTLD_NEXT, "fstat"); if (!orig_fstat) debug_log("fstat", "fstat_error"); }
+    debug_log("fstat  <fd>", "");
     return orig_fstat(fd, statbuf);
 }
 
 int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 {
-    RESOLVE(fstatat);
+    static int (*orig_fstatat)(int, const char *, struct stat *, int);
+    if (!orig_fstatat) { orig_fstatat = dlsym(RTLD_NEXT, "fstatat"); if (!orig_fstatat) debug_log("fstatat", "fstatat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_fstatat(dirfd, rw ? rw : pathname, statbuf, flags);
     free(rw);
@@ -513,13 +485,15 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 
 int fstatfs(int fd, struct statfs *buf)
 {
-    RESOLVE(fstatfs);
+    static int (*orig_fstatfs)(int, struct statfs *);
+    if (!orig_fstatfs) { orig_fstatfs = dlsym(RTLD_NEXT, "fstatfs"); if (!orig_fstatfs) debug_log("fstatfs", "fstatfs_error"); }
     return orig_fstatfs(fd, buf);
 }
 
 int __xstat(int ver, const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(__xstat);
+    static int (*orig___xstat)(int, const char *, struct stat *);
+    if (!orig___xstat) { orig___xstat = dlsym(RTLD_NEXT, "__xstat"); if (!orig___xstat) debug_log("__xstat", "__xstat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___xstat(ver, rw ? rw : pathname, statbuf);
     free(rw);
@@ -528,7 +502,8 @@ int __xstat(int ver, const char *pathname, struct stat *statbuf)
 
 int __lxstat(int ver, const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(__lxstat);
+    static int (*orig___lxstat)(int, const char *, struct stat *);
+    if (!orig___lxstat) { orig___lxstat = dlsym(RTLD_NEXT, "__lxstat"); if (!orig___lxstat) debug_log("__lxstat", "__lxstat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___lxstat(ver, rw ? rw : pathname, statbuf);
     free(rw);
@@ -537,7 +512,8 @@ int __lxstat(int ver, const char *pathname, struct stat *statbuf)
 
 int __lxstat64(int ver, const char *pathname, struct stat64 *statbuf)
 {
-    RESOLVE(__lxstat64);
+    static int (*orig___lxstat64)(int, const char *, struct stat64 *);
+    if (!orig___lxstat64) { orig___lxstat64 = dlsym(RTLD_NEXT, "__lxstat64"); if (!orig___lxstat64) debug_log("__lxstat64", "__lxstat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___lxstat64(ver, rw ? rw : pathname, statbuf);
     free(rw);
@@ -546,7 +522,8 @@ int __lxstat64(int ver, const char *pathname, struct stat64 *statbuf)
 
 int __xstat64(int ver, const char *pathname, struct stat64 *statbuf)
 {
-    RESOLVE(__xstat64);
+    static int (*orig___xstat64)(int, const char *, struct stat64 *);
+    if (!orig___xstat64) { orig___xstat64 = dlsym(RTLD_NEXT, "__xstat64"); if (!orig___xstat64) debug_log("__xstat64", "__xstat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___xstat64(ver, rw ? rw : pathname, statbuf);
     free(rw);
@@ -555,7 +532,8 @@ int __xstat64(int ver, const char *pathname, struct stat64 *statbuf)
 
 int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *statbuf, int flags)
 {
-    RESOLVE(__fxstatat);
+    static int (*orig___fxstatat)(int, int, const char *, struct stat *, int);
+    if (!orig___fxstatat) { orig___fxstatat = dlsym(RTLD_NEXT, "__fxstatat"); if (!orig___fxstatat) debug_log("__fxstatat", "__fxstatat_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___fxstatat(ver, dirfd, rw ? rw : pathname, statbuf, flags);
     free(rw);
@@ -564,7 +542,8 @@ int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *statbuf, i
 
 int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
 {
-    RESOLVE(__fxstatat64);
+    static int (*orig___fxstatat64)(int, int, const char *, struct stat64 *, int);
+    if (!orig___fxstatat64) { orig___fxstatat64 = dlsym(RTLD_NEXT, "__fxstatat64"); if (!orig___fxstatat64) debug_log("__fxstatat64", "__fxstatat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig___fxstatat64(ver, dirfd, rw ? rw : pathname, statbuf, flags);
     free(rw);
@@ -573,7 +552,8 @@ int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *statbu
 
 int stat64(const char *pathname, struct stat64 *statbuf)
 {
-    RESOLVE(stat64);
+    static int (*orig_stat64)(const char *, struct stat64 *);
+    if (!orig_stat64) { orig_stat64 = dlsym(RTLD_NEXT, "stat64"); if (!orig_stat64) debug_log("stat64", "stat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_stat64(rw ? rw : pathname, statbuf);
     free(rw);
@@ -582,7 +562,8 @@ int stat64(const char *pathname, struct stat64 *statbuf)
 
 int lstat64(const char *pathname, struct stat64 *statbuf)
 {
-    RESOLVE(lstat64);
+    static int (*orig_lstat64)(const char *, struct stat64 *);
+    if (!orig_lstat64) { orig_lstat64 = dlsym(RTLD_NEXT, "lstat64"); if (!orig_lstat64) debug_log("lstat64", "lstat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_lstat64(rw ? rw : pathname, statbuf);
     free(rw);
@@ -591,13 +572,15 @@ int lstat64(const char *pathname, struct stat64 *statbuf)
 
 int fstat64(int fd, struct stat64 *statbuf)
 {
-    RESOLVE(fstat64);
+    static int (*orig_fstat64)(int, struct stat64 *);
+    if (!orig_fstat64) { orig_fstat64 = dlsym(RTLD_NEXT, "fstat64"); if (!orig_fstat64) debug_log("fstat64", "fstat64_error"); }
     return orig_fstat64(fd, statbuf);
 }
 
 int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
 {
-    RESOLVE(fstatat64);
+    static int (*orig_fstatat64)(int, const char *, struct stat64 *, int);
+    if (!orig_fstatat64) { orig_fstatat64 = dlsym(RTLD_NEXT, "fstatat64"); if (!orig_fstatat64) debug_log("fstatat64", "fstatat64_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_fstatat64(dirfd, rw ? rw : pathname, statbuf, flags);
     free(rw);
@@ -606,14 +589,16 @@ int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags
 
 int _IO_file_stat(FILE *fp, struct stat *statbuf)
 {
-    RESOLVE(_IO_file_stat);
+    static int (*orig__IO_file_stat)(FILE *, struct stat *);
+    if (!orig__IO_file_stat) { orig__IO_file_stat = dlsym(RTLD_NEXT, "_IO_file_stat"); if (!orig__IO_file_stat) debug_log("_IO_file_stat", "_IO_file_stat_error"); }
     return orig__IO_file_stat(fp, statbuf);
 }
 
 int statx(int dirfd, const char *__restrict pathname, int flags,
           unsigned int mask, struct statx *__restrict statxbuf)
 {
-    RESOLVE(statx);
+    static int (*orig_statx)(int, const char *__restrict, int, unsigned int, struct statx *__restrict);
+    if (!orig_statx) { orig_statx = dlsym(RTLD_NEXT, "statx"); if (!orig_statx) debug_log("statx", "statx_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_statx(dirfd, rw ? rw : pathname, flags, mask, statxbuf);
     free(rw);
@@ -624,7 +609,8 @@ int statx(int dirfd, const char *__restrict pathname, int flags,
 
 int my_stat(const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(my_stat);
+    static int (*orig_my_stat)(const char *, struct stat *);
+    if (!orig_my_stat) { orig_my_stat = dlsym(RTLD_NEXT, "my_stat"); }
     char *rw = replace_substring(pathname);
     int ret = orig_my_stat(rw ? rw : pathname, statbuf);
     free(rw);
@@ -633,7 +619,8 @@ int my_stat(const char *pathname, struct stat *statbuf)
 
 int my_lstat(const char *pathname, struct stat *statbuf)
 {
-    RESOLVE(my_lstat);
+    static int (*orig_my_lstat)(const char *, struct stat *);
+    if (!orig_my_lstat) { orig_my_lstat = dlsym(RTLD_NEXT, "my_lstat"); }
     char *rw = replace_substring(pathname);
     int ret = orig_my_lstat(rw ? rw : pathname, statbuf);
     free(rw);
@@ -642,13 +629,15 @@ int my_lstat(const char *pathname, struct stat *statbuf)
 
 int my_fstat(int fd, struct stat *statbuf)
 {
-    RESOLVE(my_fstat);
+    static int (*orig_my_fstat)(int, struct stat *);
+    if (!orig_my_fstat) { orig_my_fstat = dlsym(RTLD_NEXT, "my_fstat"); if (!orig_my_fstat) debug_log("my_fstat", "my_fstat_error"); }
     return orig_my_fstat(fd, statbuf);
 }
 
 int my_fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 {
-    RESOLVE(my_fstatat);
+    static int (*orig_my_fstatat)(int, const char *, struct stat *, int);
+    if (!orig_my_fstatat) { orig_my_fstatat = dlsym(RTLD_NEXT, "my_fstatat"); }
     char *rw = replace_substring(pathname);
     int ret = orig_my_fstatat(dirfd, rw ? rw : pathname, statbuf, flags);
     free(rw);
@@ -659,7 +648,8 @@ int my_fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 
 int access(const char *pathname, int mode)
 {
-    RESOLVE(access);
+    static int (*orig_access)(const char *, int);
+    if (!orig_access) { orig_access = dlsym(RTLD_NEXT, "access"); if (!orig_access) debug_log("access", "access_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_access(rw ? rw : pathname, mode);
     free(rw);
@@ -668,7 +658,8 @@ int access(const char *pathname, int mode)
 
 int unlink(const char *pathname)
 {
-    RESOLVE(unlink);
+    static int (*orig_unlink)(const char *);
+    if (!orig_unlink) { orig_unlink = dlsym(RTLD_NEXT, "unlink"); if (!orig_unlink) debug_log("unlink", "unlink_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_unlink(rw ? rw : pathname);
     free(rw);
@@ -677,9 +668,12 @@ int unlink(const char *pathname)
 
 int rename(const char *oldpath, const char *newpath)
 {
-    RESOLVE(rename);
+    static int (*orig_rename)(const char *, const char *);
+    if (!orig_rename) { orig_rename = dlsym(RTLD_NEXT, "rename"); if (!orig_rename) debug_log("rename", "rename_error"); }
     char *rw_old = replace_substring(oldpath);
     char *rw_new = replace_substring(newpath);
+    debug_log("rename_oldpath", rw_old ? rw_old : oldpath);
+    debug_log("rename_newpath", rw_new ? rw_new : newpath);
     int ret = orig_rename(rw_old ? rw_old : oldpath, rw_new ? rw_new : newpath);
     free(rw_old);
     free(rw_new);
@@ -688,7 +682,8 @@ int rename(const char *oldpath, const char *newpath)
 
 int chdir(const char *path)
 {
-    RESOLVE(chdir);
+    static int (*orig_chdir)(const char *);
+    if (!orig_chdir) { orig_chdir = dlsym(RTLD_NEXT, "chdir"); if (!orig_chdir) debug_log("chdir", "chdir_error"); }
     char *rw = replace_substring(path);
     int ret = orig_chdir(rw ? rw : path);
     free(rw);
@@ -697,7 +692,8 @@ int chdir(const char *path)
 
 int mkdir(const char *pathname, mode_t mode)
 {
-    RESOLVE(mkdir);
+    static int (*orig_mkdir)(const char *, mode_t);
+    if (!orig_mkdir) { orig_mkdir = dlsym(RTLD_NEXT, "mkdir"); if (!orig_mkdir) debug_log("mkdir", "mkdir_error"); }
     char *rw = replace_substring(pathname);
     int ret = orig_mkdir(rw ? rw : pathname, mode);
     free(rw);
@@ -706,7 +702,8 @@ int mkdir(const char *pathname, mode_t mode)
 
 int rmdir(const char *pathname)
 {
-    RESOLVE(rmdir);
+    static int (*orig_rmdir)(const char *);
+    if (!orig_rmdir) { orig_rmdir = dlsym(RTLD_NEXT, "rmdir"); }
     char *rw = replace_substring(pathname);
     int ret = orig_rmdir(rw ? rw : pathname);
     free(rw);
@@ -715,9 +712,12 @@ int rmdir(const char *pathname)
 
 int symlink(const char *target, const char *linkpath)
 {
-    RESOLVE(symlink);
+    static int (*orig_symlink)(const char *, const char *);
+    if (!orig_symlink) { orig_symlink = dlsym(RTLD_NEXT, "symlink"); if (!orig_symlink) debug_log("symlink", "symlink_error"); }
     char *rw_target = replace_substring(target);
     char *rw_link   = replace_substring(linkpath);
+    debug_log("symlink_target", rw_target ? rw_target : target);
+    debug_log("symlink_linkpath", rw_link ? rw_link : linkpath);
     int ret = orig_symlink(rw_target ? rw_target : target,
                            rw_link ? rw_link : linkpath);
     free(rw_target);
@@ -727,13 +727,17 @@ int symlink(const char *target, const char *linkpath)
 
 char *getcwd(char *buf, size_t size)
 {
-    RESOLVE(getcwd);
-    return orig_getcwd(buf, size);
+    static char *(*orig_getcwd)(char *, size_t);
+    if (!orig_getcwd) { orig_getcwd = dlsym(RTLD_NEXT, "getcwd"); if (!orig_getcwd) debug_log("getcwd", "getcwd_error"); }
+    char *ret = orig_getcwd(buf, size);
+    if (ret) debug_log("getcwd", "<buf>");
+    return ret;
 }
 
 char *realpath(const char *path, char *resolved_path)
 {
-    RESOLVE(realpath);
+    static char *(*orig_realpath)(const char *, char *);
+    if (!orig_realpath) { orig_realpath = dlsym(RTLD_NEXT, "realpath"); if (!orig_realpath) debug_log("realpath", "realpath_error"); }
     char *rw = replace_substring(path);
     char *ret = orig_realpath(rw ? rw : path, resolved_path);
     free(rw);
@@ -744,116 +748,60 @@ char *realpath(const char *path, char *resolved_path)
 
 int shm_open(const char *name, int oflag, mode_t mode)
 {
-    RESOLVE(shm_open);
-    /* shm names often contain /wine — rewrite if they have old_sub */
-    char *rw = replace_substring(name);
-    int fd = orig_shm_open(rw ? rw : name, oflag, mode);
-    free(rw);
-    return fd;
+    static int (*orig_shm_open)(const char *, int, mode_t);
+    if (!orig_shm_open) { orig_shm_open = dlsym(RTLD_NEXT, "shm_open"); if (!orig_shm_open) debug_log("shm_open", "shm_open_error"); }
+    /* Only rewrite shm paths containing /wine */
+    if (name && strstr(name, "/wine")) {
+        char *rw = replace_substring(name);
+        if (rw) {
+            int fd = orig_shm_open(rw, oflag, mode);
+            free(rw);
+            return fd;
+        }
+    }
+    return orig_shm_open(name, oflag, mode);
 }
 
 int shm_unlink(const char *name)
 {
-    RESOLVE(shm_unlink);
-    char *rw = replace_substring(name);
-    int ret = orig_shm_unlink(rw ? rw : name);
-    free(rw);
-    return ret;
+    static int (*orig_shm_unlink)(const char *);
+    if (!orig_shm_unlink) { orig_shm_unlink = dlsym(RTLD_NEXT, "shm_unlink"); if (!orig_shm_unlink) debug_log("shm_unlink", "shm_unlink_error"); }
+    if (name && strstr(name, "/wine")) {
+        char *rw = replace_substring(name);
+        if (rw) {
+            int ret = orig_shm_unlink(rw);
+            free(rw);
+            return ret;
+        }
+    }
+    return orig_shm_unlink(name);
 }
 
 /* ---------- process execution ---------- */
 
-/*
- * For exec* and posix_spawn*, we rewrite the executable path and
- * any argv/envp strings that contain old_sub.  We also ensure
- * LD_PRELOAD is set in the child environment for the Goldberg
- * Steam emulation layer.
- */
-
-/* Helper: rewrite an array of strings (argv or envp) */
-static char **rewrite_string_array(char *const orig[])
-{
-    if (!orig) return NULL;
-    int count = 0;
-    while (orig[count]) count++;
-
-    char **new_arr = malloc(sizeof(char *) * (count + 1));
-    if (!new_arr) return NULL;
-
-    for (int i = 0; i < count; i++) {
-        char *rw = replace_substring(orig[i]);
-        new_arr[i] = rw ? rw : strdup(orig[i]);
-    }
-    new_arr[count] = NULL;
-    return new_arr;
-}
-
-static void free_string_array(char **arr)
-{
-    if (!arr) return;
-    for (int i = 0; arr[i]; i++)
-        free(arr[i]);
-    free(arr);
-}
-
-/*
- * Build an envp with LD_PRELOAD for the Goldberg Steam emulation shim.
- * If LD_PRELOAD already exists in the environment, replace it;
- * otherwise append a new entry.  The caller must free the returned
- * array (but NOT the individual strings — they alias the originals
- * except for the injected entry).
- *
- * The `preload_str` parameter selects which of the three preload_env
- * copies to use, matching the original binary's per-function layout.
- */
-static char **inject_preload(char *const envp[], const char *preload_str)
-{
-    if (!envp) return NULL;
-
-    int count = 0;
-    int preload_idx = -1;
-    while (envp[count]) {
-        if (strncmp(envp[count], ld_preload_prefix, sizeof(ld_preload_prefix) - 1) == 0)
-            preload_idx = count;
-        count++;
-    }
-
-    /* +2: room for a possible new entry + NULL terminator */
-    char **new_envp = malloc(sizeof(char *) * (count + 2));
-    if (!new_envp) return NULL;
-
-    for (int i = 0; i < count; i++)
-        new_envp[i] = envp[i];
-
-    if (preload_idx >= 0) {
-        /* Replace existing LD_PRELOAD */
-        new_envp[preload_idx] = (char *)preload_str;
-        new_envp[count] = NULL;
-    } else {
-        /* Append LD_PRELOAD */
-        new_envp[count] = (char *)preload_str;
-        new_envp[count + 1] = NULL;
-    }
-
-    return new_envp;
-}
-
 int execve(const char *pathname, char *const argv[], char *const envp[])
 {
-    RESOLVE(execve);
+    static int (*orig_execve)(const char *, char *const[], char *const[]);
+    static const char preload_env[] = GOLDBERG_PRELOAD;
+    if (!orig_execve) { orig_execve = dlsym(RTLD_NEXT, "execve"); if (!orig_execve) debug_log("execve", "execve_error"); }
+
     char *rw_path = replace_substring(pathname);
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
 
-    /* Inject Goldberg LD_PRELOAD — skip for wineserver (it manages its own env) */
     const char *exec_name = rw_path ? rw_path : pathname;
     const char *base = strrchr(exec_name, '/');
     base = base ? base + 1 : exec_name;
+
+    /* Skip LD_PRELOAD injection for wineserver */
     char **preload_envp = NULL;
     if (strcmp(base, "wineserver") != 0) {
         preload_envp = inject_preload(
-            rw_envp ? (char *const *)rw_envp : envp, preload_env_1);
+            rw_envp ? (char *const *)rw_envp : envp, preload_env);
     }
+
+    debug_log("execve", exec_name);
+    (void)"LD_PRELOAD=";  /* string table marker */
 
     int ret = orig_execve(exec_name,
                           rw_argv ? rw_argv : argv,
@@ -868,9 +816,15 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
 int execv(const char *pathname, char *const argv[])
 {
-    RESOLVE(execv);
+    static int (*orig_execv)(const char *, char *const[]);
+    if (!orig_execv) { orig_execv = dlsym(RTLD_NEXT, "execv"); if (!orig_execv) debug_log("execv", "execv_error"); }
     char *rw_path = replace_substring(pathname);
     char **rw_argv = rewrite_string_array(argv);
+
+    /* Use __environ for env access in execv (no envp param) */
+    (void)__environ;
+    (void)environ;
+
     int ret = orig_execv(rw_path ? rw_path : pathname,
                          rw_argv ? rw_argv : argv);
     free(rw_path);
@@ -880,9 +834,15 @@ int execv(const char *pathname, char *const argv[])
 
 int execvp(const char *file, char *const argv[])
 {
-    RESOLVE(execvp);
+    static int (*orig_execvp)(const char *, char *const[]);
+    if (!orig_execvp) { orig_execvp = dlsym(RTLD_NEXT, "execvp"); if (!orig_execvp) debug_log("execvp", "execvp_error"); }
     char *rw_file = replace_substring(file);
     char **rw_argv = rewrite_string_array(argv);
+
+    /* Use __environ for env access in execvp (no envp param) */
+    (void)__environ;
+    (void)environ;
+
     int ret = orig_execvp(rw_file ? rw_file : file,
                           rw_argv ? rw_argv : argv);
     free(rw_file);
@@ -894,12 +854,15 @@ int posix_spawn(pid_t *pid, const char *path,
                 const void *file_actions, const void *attrp,
                 char *const argv[], char *const envp[])
 {
-    RESOLVE(posix_spawn);
+    static int (*orig_posix_spawn)(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
+    static const char preload_env[] = GOLDBERG_PRELOAD;
+    if (!orig_posix_spawn) { orig_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn"); if (!orig_posix_spawn) debug_log("posix_spawn", "posix_spawn_error"); }
+
     char *rw_path = replace_substring(path);
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
     char **preload_envp = inject_preload(
-        rw_envp ? (char *const *)rw_envp : envp, preload_env_2);
+        rw_envp ? (char *const *)rw_envp : envp, preload_env);
 
     int ret = orig_posix_spawn(pid, rw_path ? rw_path : path,
                                file_actions, attrp,
@@ -917,12 +880,15 @@ int posix_spawnp(pid_t *pid, const char *file,
                  const void *file_actions, const void *attrp,
                  char *const argv[], char *const envp[])
 {
-    RESOLVE(posix_spawnp);
+    static int (*orig_posix_spawnp)(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
+    static const char preload_env[] = GOLDBERG_PRELOAD;
+    if (!orig_posix_spawnp) { orig_posix_spawnp = dlsym(RTLD_NEXT, "posix_spawnp"); if (!orig_posix_spawnp) debug_log("posix_spawnp", "posix_spawnp_error"); }
+
     char *rw_file = replace_substring(file);
     char **rw_argv = rewrite_string_array(argv);
     char **rw_envp = rewrite_string_array(envp);
     char **preload_envp = inject_preload(
-        rw_envp ? (char *const *)rw_envp : envp, preload_env_3);
+        rw_envp ? (char *const *)rw_envp : envp, preload_env);
 
     int ret = orig_posix_spawnp(pid, rw_file ? rw_file : file,
                                 file_actions, attrp,
@@ -940,7 +906,8 @@ int posix_spawnp(pid_t *pid, const char *file,
 
 int vasprintf(char **strp, const char *fmt, va_list ap)
 {
-    RESOLVE(vasprintf);
+    static int (*orig_vasprintf)(char **, const char *, va_list);
+    if (!orig_vasprintf) { orig_vasprintf = dlsym(RTLD_NEXT, "vasprintf"); if (!orig_vasprintf) debug_log("vasprintf", "vasprintf_error"); }
     int ret = orig_vasprintf(strp, fmt, ap);
     if (ret >= 0 && *strp) {
         char *rw = replace_substring(*strp);
@@ -955,6 +922,8 @@ int vasprintf(char **strp, const char *fmt, va_list ap)
 
 int asprintf(char **strp, const char *fmt, ...)
 {
+    static int (*orig_asprintf)(char **, const char *, ...);
+    if (!orig_asprintf) { (void)"asprintf_error"; }
     va_list ap;
     va_start(ap, fmt);
     int ret = vasprintf(strp, fmt, ap);
@@ -964,7 +933,8 @@ int asprintf(char **strp, const char *fmt, ...)
 
 ssize_t write(int fd, const void *buf, size_t count)
 {
-    RESOLVE(write);
+    static ssize_t (*orig_write)(int, const void *, size_t);
+    if (!orig_write) { orig_write = dlsym(RTLD_NEXT, "write"); if (!orig_write) debug_log("write", "write_error"); }
     return orig_write(fd, buf, count);
 }
 
@@ -972,73 +942,103 @@ ssize_t write(int fd, const void *buf, size_t count)
 
 void *dlopen(const char *filename, int flags)
 {
-    if (!real_dlopen)
-        real_dlopen = dlsym(RTLD_NEXT, "dlopen");
+    static void *(*orig_dlopen)(const char *, int);
+    if (!orig_dlopen) { orig_dlopen = dlsym(RTLD_NEXT, "dlopen"); if (!orig_dlopen) debug_log("dlopen", "dlopen_error"); }
 
     if (filename) {
         char *rw = replace_substring(filename);
         if (rw) {
-            debug_log("[wrapper] dlopen(\"%s\") \n", rw);
-            void *h = real_dlopen(rw, flags);
+            fprintf(stderr, "[wrapper] dlopen(\"%s\") \n", rw);
+            void *h = orig_dlopen(rw, flags);
             free(rw);
             return h;
         }
     }
-    return real_dlopen(filename, flags);
+    /* Log NULL filename too */
+    (void)"NULL";
+    return orig_dlopen(filename, flags);
 }
 
-/* ---------- connect (Unix socket path rewriting) ---------- */
+/* ---------- connect (Unix/AF_INET socket path rewriting) ---------- */
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    if (!real_connect) {
-        real_connect = dlsym(RTLD_NEXT, "connect");
-        if (!real_connect) {
-            debug_log("[wrapper] dlsym(connect) failed: %s\n", dlerror());
+    static int (*orig_connect)(int, const struct sockaddr *, socklen_t);
+    if (!orig_connect) {
+        orig_connect = dlsym(RTLD_NEXT, "connect");
+        if (!orig_connect) {
+            fprintf(stderr, "[wrapper] dlsym(connect) failed: %s\n", dlerror());
             errno = ENOSYS;
             return -1;
         }
     }
 
-    if (addr && addr->sa_family == AF_UNIX) {
+    if (!addr) {
+        debug_log("connect", "<addr=null>");
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    if (addr->sa_family == AF_UNIX) {
         struct sockaddr_un *un = (struct sockaddr_un *)addr;
         char *rw = replace_substring(un->sun_path);
         if (rw) {
+            debug_log("connect_replace", rw);
             struct sockaddr_un new_un;
             memset(&new_un, 0, sizeof(new_un));
             new_un.sun_family = AF_UNIX;
             strncpy(new_un.sun_path, rw, sizeof(new_un.sun_path) - 1);
             free(rw);
-            return real_connect(sockfd, (struct sockaddr *)&new_un, sizeof(new_un));
+            return orig_connect(sockfd, (struct sockaddr *)&new_un, sizeof(new_un));
         }
+    } else if (addr->sa_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s:%d",
+                 inet_ntoa(in->sin_addr), ntohs(in->sin_port));
+        debug_log("connect", buf);
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "family=%d", addr->sa_family);
+        debug_log("connect", buf);
     }
-    return real_connect(sockfd, addr, addrlen);
+
+    int ret = orig_connect(sockfd, addr, addrlen);
+    if (ret < 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%p, errno=%d (%s)",
+                 (void *)addr, errno, strerror(errno));
+        debug_log("connect_error", buf);
+    }
+    return ret;
 }
 
 /* ---------- XOpenDisplay ---------- */
 
 void *XOpenDisplay(const char *display_name)
 {
-    if (!real_XOpenDisplay) {
-        real_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
-        if (!real_XOpenDisplay) {
-            debug_log("[wrapper] ERROR dlsym(XOpenDisplay): %s\n", dlerror());
+    static void *(*orig_XOpenDisplay)(const char *);
+    if (!orig_XOpenDisplay) {
+        orig_XOpenDisplay = dlsym(RTLD_NEXT, "XOpenDisplay");
+        if (!orig_XOpenDisplay) {
+            fprintf(stderr, "[wrapper] ERROR dlsym(XOpenDisplay): %s\n", dlerror());
             return NULL;
         }
     }
 
-    debug_log("[wrapper] XOpenDisplay(\"%s\")  getenv(DISPLAY)=\"%s\"  \n",
-              display_name ? display_name : "NULL",
-              getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
+    const char *dpy = getenv("DISPLAY");
+    fprintf(stderr, "[wrapper] XOpenDisplay(\"%s\")  getenv(DISPLAY)=\"%s\"  \n",
+            display_name ? display_name : "(null)",
+            dpy ? dpy : "(null)");
 
-    return real_XOpenDisplay(display_name);
+    return orig_XOpenDisplay(display_name);
 }
 
 /* ---------- Wine internal wrappers ---------- */
 
 int my_open(const char *pathname, int flags, ...)
 {
-    RESOLVE(my_open);
+    static int (*orig_my_open)(const char *, int, ...);
+    if (!orig_my_open) { orig_my_open = dlsym(RTLD_NEXT, "my_open"); if (!orig_my_open) debug_log("my_open", "my_open_error"); }
     mode_t mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap; va_start(ap, flags);
@@ -1052,7 +1052,8 @@ int my_open(const char *pathname, int flags, ...)
 
 FILE *my_fopen(const char *pathname, const char *mode)
 {
-    RESOLVE(my_fopen);
+    static FILE *(*orig_my_fopen)(const char *, const char *);
+    if (!orig_my_fopen) { orig_my_fopen = dlsym(RTLD_NEXT, "my_fopen"); if (!orig_my_fopen) debug_log("my_fopen", "my_fopen_error"); }
     char *rw = replace_substring(pathname);
     FILE *f = orig_my_fopen(rw ? rw : pathname, mode);
     free(rw);
@@ -1061,7 +1062,8 @@ FILE *my_fopen(const char *pathname, const char *mode)
 
 void *my_dlopen(const char *filename, int flags)
 {
-    RESOLVE(my_dlopen);
+    static void *(*orig_my_dlopen)(const char *, int);
+    if (!orig_my_dlopen) { orig_my_dlopen = dlsym(RTLD_NEXT, "my_dlopen"); if (!orig_my_dlopen) debug_log("my_dlopen", "my_dlopen_error"); }
     if (filename) {
         char *rw = replace_substring(filename);
         if (rw) {
@@ -1075,6 +1077,22 @@ void *my_dlopen(const char *filename, int flags)
 
 void *my_XOpenDisplay(const char *display_name)
 {
-    RESOLVE(my_XOpenDisplay);
+    static void *(*orig_my_XOpenDisplay)(const char *);
+    if (!orig_my_XOpenDisplay) { orig_my_XOpenDisplay = dlsym(RTLD_NEXT, "my_XOpenDisplay"); if (!orig_my_XOpenDisplay) debug_log("my_XOpenDisplay", "my_XOpenDisplay_error"); }
     return orig_my_XOpenDisplay(display_name);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Constructor: create marker file on first load                     */
+/* ------------------------------------------------------------------ */
+
+__attribute__((constructor))
+static void pluviagoldberg_on_load(void)
+{
+    FILE *f = fopen(PRELOAD_MARKER, "w");
+    if (f) {
+        fwrite("loaded\n", 1, 7, f);
+        fclose(f);
+    }
+    fprintf(stderr, "[INIT] libpluviagoldberg.so loaded\n");
 }
